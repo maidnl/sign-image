@@ -18,10 +18,11 @@ import (
 const (
 	ImageMagic       uint32 = 0x96f3b83d
 	TlvInfoMagic     uint16 = 0x6907
+	TlvKeyHash       uint8  = 0x01
 	TlvSha256        uint8  = 0x10
 	TlvRsa2048       uint8  = 0x20
 	HeaderSize       uint16 = 0x400
-	SlotSize         int    = 1540096 // From your --slot-size flag
+	SlotSize         int    = 1540096
 )
 
 // ImageVersion matches your --version 1.0.1+0 flag
@@ -50,6 +51,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to read input binary: %v", err)
 	}
+
+	fmt.Println(len(fileData));
 
 	if len(fileData) < int(HeaderSize) {
 		log.Fatalf("Input file is too small to contain the 0x400 header space")
@@ -109,26 +112,31 @@ func main() {
 	// Write the actual application payload
 	img.Write(actualPayload)
 
-	// 6. Calculate SHA-256 Hash of Header + Padding + Payload
-	hash := sha256.Sum256(img.Bytes())
+// 6. Calculate SHA-256 Hash of Header + Padding + Payload
+	imgHash := sha256.Sum256(img.Bytes())
 
-	// 7. Generate RSA-PSS Signature
-	signature, err := rsa.SignPSS(rand.Reader, privKey, crypto.SHA256, hash[:], &rsa.PSSOptions{
+	// 7. Calculate the KEYHASH (SHA-256 of the DER-encoded PKIX Public Key)
+	pubKeyBytes, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	if err != nil {
+		log.Fatalf("Failed to marshal public key: %v", err)
+	}
+	keyHash := sha256.Sum256(pubKeyBytes)
+
+	// 8. Generate RSA-PSS Signature using the image hash
+	signature, err := rsa.SignPSS(rand.Reader, privKey, crypto.SHA256, imgHash[:], &rsa.PSSOptions{
 		SaltLength: rsa.PSSSaltLengthEqualsHash,
 	})
 	if err != nil {
 		log.Fatalf("Failed to sign payload: %v", err)
 	}
 
-	// 8. Append TLV Trailer
-	appendTLVs(&img, hash[:], signature)
-
-	// 9. Size Validation (Replicating Zephyr's safety check)
+	// 9. Append TLV Trailer
+	appendTLVs(&img, keyHash[:], imgHash[:], signature)
+// 9b. Size Validation
 	totalImageSize := img.Len()
 	if totalImageSize > SlotSize {
 		log.Fatalf("Error: Final image size (%d) exceeds the defined slot size (%d)!", totalImageSize, SlotSize)
 	}
-
 	// 10. Save the final signed binary
 	err = os.WriteFile("zephyr.signed.bin", img.Bytes(), 0644)
 	if err != nil {
@@ -140,21 +148,27 @@ func main() {
 	fmt.Printf("Total size:   %d bytes\n", totalImageSize)
 }
 
-// appendTLVs handles the trailer struct packing (Little Endian)
-func appendTLVs(img *bytes.Buffer, hash []byte, sig []byte) {
-	// Calculate total TLV size: InfoHeader(4) + SHA256(4 + 32) + RSA(4 + 256) = 300 bytes
+func appendTLVs(img *bytes.Buffer, keyHash []byte, imgHash []byte, sig []byte) {
+	// TLV Info Header: Magic (2 bytes) + Total Size (2 bytes) = 4 bytes
+	// 4 + SHA256(36) + KeyHash(36) + RSA(260) = 336 bytes exactly
 	binary.Write(img, binary.LittleEndian, TlvInfoMagic)
-	binary.Write(img, binary.LittleEndian, uint16(300))
+	binary.Write(img, binary.LittleEndian, uint16(336))
 
-	// Write SHA256 TLV (Type, Reserved padding, Length, Value)
+	// 1. Write SHA256 TLV (Type 0x10)
 	binary.Write(img, binary.LittleEndian, TlvSha256)
-	binary.Write(img, binary.LittleEndian, uint8(0)) 
-	binary.Write(img, binary.LittleEndian, uint16(len(hash)))
-	img.Write(hash)
+	binary.Write(img, binary.LittleEndian, uint8(0)) // 8-bit pad
+	binary.Write(img, binary.LittleEndian, uint16(len(imgHash)))
+	img.Write(imgHash)
 
-	// Write RSA Signature TLV (Type, Reserved padding, Length, Value)
+	// 2. Write KeyHash TLV (Type 0x01)
+	binary.Write(img, binary.LittleEndian, TlvKeyHash)
+	binary.Write(img, binary.LittleEndian, uint8(0)) // 8-bit pad
+	binary.Write(img, binary.LittleEndian, uint16(len(keyHash)))
+	img.Write(keyHash)
+
+	// 3. Write RSA Signature TLV (Type 0x20)
 	binary.Write(img, binary.LittleEndian, TlvRsa2048)
-	binary.Write(img, binary.LittleEndian, uint8(0)) 
+	binary.Write(img, binary.LittleEndian, uint8(0)) // 8-bit pad
 	binary.Write(img, binary.LittleEndian, uint16(len(sig)))
 	img.Write(sig)
 }
