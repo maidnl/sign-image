@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -44,8 +45,31 @@ type ImageHeader struct {
 }
 
 func main() {
-	// 1. Read the pre-padded binary from Zephyr
-	fileData, err := os.ReadFile("zephyr.bin")
+	var loader_bin_file = flag.String("loader_bin", "", "Path to the binary loader to be used");
+	var sketch_bin_file = flag.String("sketch_bin", "", "Path to the binary sketch to be used");
+	var pem_file = flag.String("pem_file", "", "Path to the PEM file containg keys");
+	var erase_flash_dim = flag.String("erase_flash_dim", "", "Minimum erasing flash sector dimension");
+
+	flag.Parse();
+
+	_ = loader_bin_file;
+	_ = sketch_bin_file;
+	_ = pem_file;
+	_ = erase_flash_dim;
+
+	var fileData []byte;
+	var err error;
+
+	if *loader_bin_file != "" {
+		fmt.Println("loader bin file defined");
+	   fileData, err = os.ReadFile(*loader_bin_file);
+		if err != nil {
+			log.Fatalf("Error reading loader binary file: %v", err)
+		}
+	} else {
+		fmt.Println("loader bin file UNDEFINED");
+	}
+
 	if err != nil {
 		log.Fatalf("Failed to read input binary: %v", err)
 	}
@@ -98,7 +122,15 @@ func main() {
 		log.Fatalf("Failed to write header: %v", err)
 	}
 	copy(imageBytes[0:32], headerBuf.Bytes())
-
+   
+	var myVar uint32 = 0xAABBCCDD
+	var address bytes.Buffer
+	err = binary.Write(&address, binary.LittleEndian, myVar)
+	if err != nil {
+		log.Fatalf("Failed to write header: %v", err)
+	}
+	
+	copy(imageBytes[32:36], address.Bytes())
 	// 6. Calculate SHA-256 Hash of the exact byte-for-byte image
 	imgHash := sha256.Sum256(imageBytes)
 
