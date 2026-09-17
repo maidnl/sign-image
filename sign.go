@@ -57,12 +57,14 @@ func main() {
 	_ = pem_file;
 	_ = erase_flash_dim;
 
-	var fileData []byte;
+	var loader_bin []byte;
+	var sketch_bin []byte;
 	var err error;
 
+	/* READING LOADER BINARY FILE */
 	if *loader_bin_file != "" {
 		fmt.Println("loader bin file defined");
-	   fileData, err = os.ReadFile(*loader_bin_file);
+	   loader_bin, err = os.ReadFile(*loader_bin_file);
 		if err != nil {
 			log.Fatalf("Error reading loader binary file: %v", err)
 		}
@@ -70,9 +72,25 @@ func main() {
 		fmt.Println("loader bin file UNDEFINED");
 	}
 
-	if err != nil {
-		log.Fatalf("Failed to read input binary: %v", err)
+	_ = loader_bin	
+
+	
+	/* READING LOADER BINARY FILE */
+	if *sketch_bin_file != "" {
+		fmt.Println("sketch bin file defined");
+	   sketch_bin, err = os.ReadFile(*sketch_bin_file);
+		if err != nil {
+			log.Fatalf("Error reading sketch binary file: %v", err)
+		}
+	} else {
+		fmt.Println("sketch bin file UNDEFINED");
 	}
+
+	_ = sketch_bin;
+	
+
+	var fileData []byte;
+
 
 	if len(fileData) < int(HeaderSize) {
 		log.Fatalf("Input file is too small to contain the 0x400 header space")
