@@ -48,7 +48,7 @@ func main() {
 	var loader_bin_file = flag.String("loader_bin", "", "Path to the binary loader to be used");
 	var sketch_bin_file = flag.String("sketch_bin", "", "Path to the binary sketch to be used");
 	var pem_file = flag.String("pem_file", "", "Path to the PEM file containg keys");
-	var erase_flash_dim = flag.String("erase_flash_dim", "", "Minimum erasing flash sector dimension");
+	var erase_flash_dim = flag.Int("erase_flash_dim", 0, "Minimum erasing flash sector dimension in bytes");
 
 	flag.Parse();
 
@@ -71,9 +71,6 @@ func main() {
 	} else {
 		fmt.Println("loader bin file UNDEFINED");
 	}
-
-	_ = loader_bin	
-
 	
 	/* READING LOADER BINARY FILE */
 	if *sketch_bin_file != "" {
@@ -87,7 +84,25 @@ func main() {
 	}
 
 	_ = sketch_bin;
+
+	/* CALCULATING PADDING to the SKETCH */	
+	loader_len := len(loader_bin);
+	fmt.Println(len(loader_bin));
+	fmt.Printf("%d (0x%x)\n",loader_len, loader_len);
 	
+
+	/* Calculate padding */
+	var padding_len = 0;
+
+	if *erase_flash_dim != 0 {
+		padding_len = *erase_flash_dim - (loader_len % *erase_flash_dim);
+	}
+
+	align_padding := make([]byte,padding_len);
+
+
+	sketch_offset := uint32(padding_len + loader_len);
+	fmt.Printf("align_padding = %d, total size = %d (0x%x)", len(align_padding), sketch_offset, sketch_offset)
 
 	var fileData []byte;
 
