@@ -48,7 +48,7 @@ func main() {
 	var loader_bin_file = flag.String("loader_bin", "", "Path to the binary loader to be used");
 	var sketch_bin_file = flag.String("sketch_bin", "", "Path to the binary sketch to be used");
 	var pem_file = flag.String("pem_file", "", "Path to the PEM file containg keys");
-	var erase_flash_dim = flag.Int("erase_flash_dim", 0, "Minimum erasing flash sector dimension in bytes");
+	var erase_flash_dim = flag.Uint("erase_flash_dim", 0, "Minimum erasing flash sector dimension in bytes");
 
 	flag.Parse();
 
@@ -83,35 +83,45 @@ func main() {
 		fmt.Println("sketch bin file UNDEFINED");
 	}
 
-	_ = sketch_bin;
+	sketch_len := uint32(len(sketch_bin));
 
 	/* CALCULATING PADDING to the SKETCH */	
-	loader_len := len(loader_bin);
+	loader_len := uint32(len(loader_bin));
 	fmt.Println(len(loader_bin));
 	fmt.Printf("%d (0x%x)\n",loader_len, loader_len);
 	
 
 	/* Calculate padding */
-	var padding_len = 0;
+	var padding_len uint32 = 0;
 
 	if *erase_flash_dim != 0 {
-		padding_len = *erase_flash_dim - (loader_len % *erase_flash_dim);
+		padding_len = uint32(*erase_flash_dim) - (loader_len % uint32(*erase_flash_dim));
 	}
 
 	align_padding := make([]byte,padding_len);
 
 
 	sketch_offset := uint32(padding_len + loader_len);
-	fmt.Printf("align_padding = %d, total size = %d (0x%x)", len(align_padding), sketch_offset, sketch_offset)
+	fmt.Printf("align_padding = %d, total size = %d (0x%x)\n", len(align_padding), sketch_offset, sketch_offset)
 
-	var fileData []byte;
+	/* check dimensions (?) */
+
+	total_size := loader_len + padding_len + sketch_len;
+
+	fmt.Printf("TOTAL SIZE: %d\n", total_size);
 
 
-	if len(fileData) < int(HeaderSize) {
-		log.Fatalf("Input file is too small to contain the 0x400 header space")
+
+	image := make([]byte,total_size);
+	pos := copy(image, loader_bin);
+	pos += copy(image[pos:], align_padding);
+	/* sketch could not be present, but padding always is so that
+      the address sketch is always correctly calculated */
+	if(sketch_len > 0) { 
+		copy(image[pos:], sketch_bin);
 	}
 
-	// 2. Load and parse the RSA Private Key
+	/* LOAD AND PARSE THE PRIVATE KEY */
 	keyFile, err := os.ReadFile("root-rsa-2048.pem")
 	if err != nil {
 		log.Fatalf("Failed to read key: %v", err)
@@ -127,18 +137,13 @@ func main() {
 		log.Fatalf("Failed to parse RSA key: %v", err)
 	}
 
-	// 3. Keep the entire pre-padded binary from Zephyr intact
-	imageBytes := make([]byte, len(fileData))
-	copy(imageBytes, fileData)
-
-	// 4. Construct the MCUboot Header
+	/* CONSTRUCT IMAGE HEADER */
 	header := ImageHeader{
 		Magic:     ImageMagic,
 		LoadAddr:  0x0,
 		HdrSize:   HeaderSize,
 		PTLVSize:  0,
-		// ImageSize is Total Size minus the 0x400 header reservation
-		ImageSize: uint32(len(imageBytes)) - uint32(HeaderSize), 
+		ImageSize: uint32(len(image)) - uint32(HeaderSize), 
 		Flags:     0x0, 
 		Version: ImageVersion{
 			Major:    1,
@@ -148,31 +153,29 @@ func main() {
 		},
 	}
 
-	// 5. Overwrite ONLY the first 32 bytes with the little-endian header
+	/* OVERWRITE THE FIRST 32 BYTE OF THE IMAGE WITH THE NEW HEADER */
 	var headerBuf bytes.Buffer
 	err = binary.Write(&headerBuf, binary.LittleEndian, header)
 	if err != nil {
 		log.Fatalf("Failed to write header: %v", err)
 	}
-	copy(imageBytes[0:32], headerBuf.Bytes())
-   
-	var myVar uint32 = 0xAABBCCDD
-	var address bytes.Buffer
-	err = binary.Write(&address, binary.LittleEndian, myVar)
-	if err != nil {
-		log.Fatalf("Failed to write header: %v", err)
-	}
+	copy(image[0:32], headerBuf.Bytes())
+  
+	/* OVERWIRTE NEXT 4 bytes WITH THE ADDRESS THE LOADER WILL BE PLACED */
+	binary.LittleEndian.PutUint32(image[32:36], sketch_offset)
 	
-	copy(imageBytes[32:36], address.Bytes())
-	// 6. Calculate SHA-256 Hash of the exact byte-for-byte image
-	imgHash := sha256.Sum256(imageBytes)
+	binary.LittleEndian.PutUint32(image[36:40], uint32(*erase_flash_dim))
+	
+	block_num := (sketch_len / uint32(*erase_flash_dim)) + 1
+	binary.LittleEndian.PutUint32(image[40:44], block_num)
+	/* CALCULATE THE HASH OF THE WHOLE IMAGE */
+	imgHash := sha256.Sum256(image)
 
-	// 7. Calculate the KEYHASH (SHA-256 of the PKCS#1 DER-encoded Public Key)
-	// THIS FIXES THE BOOTUTIL_FIND_KEY FAILURE
+	/* Calculate the KEYHASH (SHA-256 of the PKCS#1 DER-encoded Public Key) */
 	pubKeyBytes := x509.MarshalPKCS1PublicKey(&privKey.PublicKey)
 	keyHash := sha256.Sum256(pubKeyBytes)
 
-	// 8. Generate RSA-PSS Signature
+	/* Generate RSA-PSS Signature */
 	signature, err := rsa.SignPSS(rand.Reader, privKey, crypto.SHA256, imgHash[:], &rsa.PSSOptions{
 		SaltLength: rsa.PSSSaltLengthEqualsHash,
 	})
@@ -182,7 +185,7 @@ func main() {
 
 	// 9. Buffer for final output
 	var finalImg bytes.Buffer
-	finalImg.Write(imageBytes)
+	finalImg.Write(image)
 	appendTLVs(&finalImg, keyHash[:], imgHash[:], signature)
 
 	// 10. Size Validation & Save
