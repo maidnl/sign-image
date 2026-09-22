@@ -84,11 +84,11 @@ func main() {
 	}
 
 	sketch_len := uint32(len(sketch_bin));
+	fmt.Printf(">>> sketch len = %d (0x%08X)\n", sketch_len, sketch_len);
 
 	/* CALCULATING PADDING to the SKETCH */	
 	loader_len := uint32(len(loader_bin));
-	fmt.Println(len(loader_bin));
-	fmt.Printf("%d (0x%x)\n",loader_len, loader_len);
+	fmt.Printf(">>> Loader size %d (0x%08X)\n",loader_len, loader_len);
 	
 
 	/* Calculate padding */
@@ -98,29 +98,34 @@ func main() {
 		padding_len = uint32(*erase_flash_dim) - (loader_len % uint32(*erase_flash_dim));
 	}
 
+	fmt.Printf(">>> padding len = %d (0x%08X)\n", padding_len, padding_len);
+
 	align_padding := make([]byte,padding_len);
 
 
 	sketch_offset := uint32(padding_len + loader_len);
-	fmt.Printf("align_padding = %d, total size = %d (0x%x)\n", len(align_padding), sketch_offset, sketch_offset)
+	fmt.Printf(">>> sketch offset = %d (0x%x)\n", sketch_offset, sketch_offset)
 
 	/* check dimensions (?) */
 
 	total_size := loader_len + padding_len + sketch_len;
 
-	fmt.Printf("TOTAL SIZE: %d\n", total_size);
-
-
+	fmt.Printf(">>> total size = %d (0x%08X)\n", total_size, total_size);
 
 	image := make([]byte,total_size);
 	pos := copy(image, loader_bin);
+
+	fmt.Printf("Pos after writing loader: %d\n", pos);
+
 	pos += copy(image[pos:], align_padding);
+	fmt.Printf("Pos after writing padding: %d\n", pos);
 	/* sketch could not be present, but padding always is so that
       the address sketch is always correctly calculated */
 	if(sketch_len > 0) { 
-		copy(image[pos:], sketch_bin);
+		pos += copy(image[pos:], sketch_bin);
 	}
 
+	fmt.Printf("Pos after writing sketch: %d\n", pos);
 	/* LOAD AND PARSE THE PRIVATE KEY */
 	keyFile, err := os.ReadFile("root-rsa-2048.pem")
 	if err != nil {
