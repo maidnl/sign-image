@@ -13,6 +13,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"bufio"
+	"strings"
+	"strconv"
+	"path/filepath"
+	"regexp"
 )
 
 // MCUboot Header & Configuration Constants
@@ -44,11 +49,113 @@ type ImageHeader struct {
 	Pad1      uint32
 }
 
+const (
+	ConfigPaddingEraseDim = "FLASH_ALIGN_BASED_ON_DT_ERASE_DIM"
+	ConfigPaddingCustomDim = "CUSTOM_FLASH_ALIGN_ACTIVE"
+)
+
+func GetConfigValue(filePath string, configName string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// Ensure clean prefix matching (e.g., CONFIG_FOO=)
+	targetConfig := strings.TrimSuffix(configName, "=")
+	searchPrefix := targetConfig + "="
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip comments and empty lines
+		if len(line) == 0 || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.HasPrefix(line, searchPrefix) {
+			// Extract the value after the "="
+			value := strings.TrimPrefix(line, searchPrefix)
+			
+			// Optional: Remove surrounding quotes if it's a string configuration
+			value = strings.Trim(value, `"`)
+			
+			return value, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+
+	// Return an error if the loop finishes without finding the config
+	return "", fmt.Errorf("configuration '%s' not found", targetConfig)
+}
+
+func HasConfig(filePath string, configName string) (bool, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	// Ensure clean prefix matching (e.g., CONFIG_FOO=)
+	targetConfig := strings.TrimSuffix(configName, "=")
+	searchPrefix := targetConfig + "="
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip comments (which includes "# CONFIG_XYZ is not set") and empty lines
+		if len(line) == 0 || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.HasPrefix(line, searchPrefix) {
+			return true, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+// ConfigPathFromBin replaces the file extension of the given path with ".config"
+func ConfigPathFromBin(binPath string) string {
+	// filepath.Ext gets the current extension (e.g., ".bin")
+	// strings.TrimSuffix removes it, and we append the new one
+	return strings.TrimSuffix(binPath, filepath.Ext(binPath)) + ".config"
+}
+
+/* 
+ *  The loader binary file name zephyr.bin file produced by sysbuild has already
+ *  an initial padding of 1024 bytes. 
+ *  This is done to have a binary files that is ready for the following signing 
+ *  binary phase: a blank MCUboot header is already provided and can simply 
+ *  be written with the correct information.
+ *  The zephyr.signed.bin file is the zephyr.bin file signed. This means that
+ *  the first 32 bytes of the header are written and to the end of the file the 
+ *  TLV section containing signature information is added.
+ *  Here we use zephyr.bin file (NOT the signed version) to avoid to have also
+ *  the additional TLV part in the final Image.
+ *  However please note that we do not add the header because a blank one has
+ *   been already provided by the sysbuild process.
+ *  Depending on CONFIG PARAMETER of the variants the padding is automatically
+ *  added 
+ */
+
 func main() {
-	var loader_bin_file = flag.String("loader_bin", "", "Path to the binary loader to be used");
+	var loader_bin_file = flag.String("loader_bin", "", "Path to the binary loader to be used, with initial padding, not signed");
 	var sketch_bin_file = flag.String("sketch_bin", "", "Path to the binary sketch to be used");
 	var pem_file = flag.String("pem_file", "", "Path to the PEM file containg keys");
 	var erase_flash_dim = flag.Uint("erase_flash_dim", 0, "Minimum erasing flash sector dimension in bytes");
+
+	var config_file string = "undefined"; 
 
 	flag.Parse();
 
@@ -61,47 +168,105 @@ func main() {
 	var sketch_bin []byte;
 	var err error;
 
-	/* READING LOADER BINARY FILE */
+	/*
+	 * READING LOADER BINARY FILE
+	 * ---------------------------*/
+	
 	if *loader_bin_file != "" {
 		fmt.Println("loader bin file defined");
 	   loader_bin, err = os.ReadFile(*loader_bin_file);
 		if err != nil {
 			log.Fatalf("Error reading loader binary file: %v", err)
 		}
+
+		/* 
+		 * Gathering config filename from bin one
+	    * -------------------------------------- */
+		config_file = ConfigPathFromBin(*loader_bin_file);
 	} else {
 		fmt.Println("loader bin file UNDEFINED");
 	}
+
+	/*
+	 * CALCULATING LOADER SIZE
+	 * ---------------------------*/
+	loader_len := uint32(len(loader_bin));
+	fmt.Printf(">>> Loader size %d (0x%08X)\n",loader_len, loader_len);
+
+
+	if config_file == "undefined" {
+		log.Fatalf("Error: unable to find config file");
+	}
+
+	/* 
+	 * VERIFYING (from configuration) if PADDING was added
+	 * --------------------------------------------------- */
+	erase_padding_is_present, err := HasConfig(config_file,ConfigPaddingEraseDim)
+	if err != nil {
+		log.Fatalf("Error: problem during config file parsing")
+	}
+	_ = erase_padding_is_present;
+
+	var custom_padding_dim string = "1024";
+
+	custom_padding_is_present, err := HasConfig(config_file,ConfigPaddingEraseDim)
+	if err != nil {
+		log.Fatalf("Error: problem during config file parsing")
+	}
 	
-	/* READING LOADER BINARY FILE */
+	if custom_padding_is_present {
+		custom_padding_dim, err = GetConfigValue(config_file,ConfigPaddingEraseDim)
+		if err != nil {
+			log.Fatalf("Error: problem during config file parsing")
+		}
+	}
+
+	/* 
+	 * READING SKETCH BINARY FILE
+	 * ---------------------------*/
+	var sketch_len uint32 = 0;
 	if *sketch_bin_file != "" {
 		fmt.Println("sketch bin file defined");
 	   sketch_bin, err = os.ReadFile(*sketch_bin_file);
 		if err != nil {
 			log.Fatalf("Error reading sketch binary file: %v", err)
+		} else {
+			sketch_len = uint32(len(sketch_bin));
 		}
 	} else {
 		fmt.Println("sketch bin file UNDEFINED");
 	}
 
-	sketch_len := uint32(len(sketch_bin));
 	fmt.Printf(">>> sketch len = %d (0x%08X)\n", sketch_len, sketch_len);
 
-	/* CALCULATING PADDING to the SKETCH */	
-	loader_len := uint32(len(loader_bin));
-	fmt.Printf(">>> Loader size %d (0x%08X)\n",loader_len, loader_len);
+	/* 
+    * CALCULATING PADDING
+    * --------------------*/
 	
+	/* if no padding is configured OR erase padding is present, in any case
+    * we pad with erase_flash_dim alignment (default) */
+	var padding_alignement uint32 = uint32(*erase_flash_dim);
 
-	/* Calculate padding */
+	/* Verify padding algorithm */
+	if custom_padding_is_present {
+		padInt, err := strconv.Atoi(custom_padding_dim);
+		padding_alignement = uint32(padInt);
+		if err != nil {
+			log.Fatalf("Error converting to integer:", err)
+		}
+	}
+	
 	var padding_len uint32 = 0;
 
-	if *erase_flash_dim != 0 {
-		padding_len = uint32(*erase_flash_dim) - (loader_len % uint32(*erase_flash_dim));
-	}
+	padding_len = padding_alignement - (loader_len % padding_alignement);
 
 	fmt.Printf(">>> padding len = %d (0x%08X)\n", padding_len, padding_len);
 
 	align_padding := make([]byte,padding_len);
 
+	/* 
+	 * CALCULATING SKETCH OFFSET
+	 * -------------------------*/
 
 	sketch_offset := uint32(padding_len + loader_len);
 	fmt.Printf(">>> sketch offset = %d (0x%x)\n", sketch_offset, sketch_offset)
@@ -112,21 +277,28 @@ func main() {
 
 	fmt.Printf(">>> total size = %d (0x%08X)\n", total_size, total_size);
 
+	/* 
+	 * MAKE NEW IMAGE
+	 * ----------------*/
+	
 	image := make([]byte,total_size);
+
+	/* COPY LOADER */
+
 	pos := copy(image, loader_bin);
 
-	fmt.Printf("Pos after writing loader: %d\n", pos);
+	/* COPY PADDING */
 
 	pos += copy(image[pos:], align_padding);
-	fmt.Printf("Pos after writing padding: %d\n", pos);
-	/* sketch could not be present, but padding always is so that
-      the address sketch is always correctly calculated */
+
+	/* COPY SKETCH (if present) */
+	
 	if(sketch_len > 0) { 
 		pos += copy(image[pos:], sketch_bin);
 	}
 
-	fmt.Printf("Pos after writing sketch: %d\n", pos);
 	/* LOAD AND PARSE THE PRIVATE KEY */
+
 	keyFile, err := os.ReadFile("root-rsa-2048.pem")
 	if err != nil {
 		log.Fatalf("Failed to read key: %v", err)
@@ -143,6 +315,7 @@ func main() {
 	}
 
 	/* CONSTRUCT IMAGE HEADER */
+
 	header := ImageHeader{
 		Magic:     ImageMagic,
 		LoadAddr:  0x0,
@@ -159,6 +332,7 @@ func main() {
 	}
 
 	/* OVERWRITE THE FIRST 32 BYTE OF THE IMAGE WITH THE NEW HEADER */
+
 	var headerBuf bytes.Buffer
 	err = binary.Write(&headerBuf, binary.LittleEndian, header)
 	if err != nil {
@@ -166,14 +340,21 @@ func main() {
 	}
 	copy(image[0:32], headerBuf.Bytes())
   
-	/* OVERWIRTE NEXT 4 bytes WITH THE ADDRESS THE LOADER WILL BE PLACED */
+	/* WRITE INTO THE PADDING THE INFORMATION */
 	binary.LittleEndian.PutUint32(image[32:36], sketch_offset)
-	
 	binary.LittleEndian.PutUint32(image[36:40], uint32(*erase_flash_dim))
-	
 	block_num := (sketch_len / uint32(*erase_flash_dim)) + 1
 	binary.LittleEndian.PutUint32(image[40:44], block_num)
-	/* CALCULATE THE HASH OF THE WHOLE IMAGE */
+	if custom_padding_is_present {
+		binary.LittleEndian.PutUint32(image[44:48], 2)
+	} else {
+		binary.LittleEndian.PutUint32(image[44:48], 1)
+	}
+	
+	/*
+	 * CALCULATE THE HASH OF THE WHOLE IMAGE 
+*   */
+
 	imgHash := sha256.Sum256(image)
 
 	/* Calculate the KEYHASH (SHA-256 of the PKCS#1 DER-encoded Public Key) */
@@ -188,12 +369,12 @@ func main() {
 		log.Fatalf("Failed to sign payload: %v", err)
 	}
 
-	// 9. Buffer for final output
+	// Buffer for final output
 	var finalImg bytes.Buffer
 	finalImg.Write(image)
 	appendTLVs(&finalImg, keyHash[:], imgHash[:], signature)
 
-	// 10. Size Validation & Save
+	// Size Validation & Save
 	totalImageSize := finalImg.Len()
 	if totalImageSize > SlotSize {
 		log.Fatalf("Error: Final image size (%d) exceeds the defined slot size (%d)!", totalImageSize, SlotSize)
