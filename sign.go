@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"path/filepath"
 	"regexp"
+	"errors"
 )
 
 // MCUboot Header & Configuration Constants
@@ -125,11 +126,90 @@ func HasConfig(filePath string, configName string) (bool, error) {
 	return false, nil
 }
 
+// extractNodeBlock finds a labeled DTS node (e.g., slot0_partition: partition@xxx { ... }) 
+// and returns the string contents inside its curly braces.
+func extractNodeBlock(dtsContent, nodeName string) (string, error) {
+   // Match pattern: nodeName: [anything but {] { [capture block] }
+   pattern := fmt.Sprintf(`(?s)%s:\s*[^{]*\{([^}]+)\}`, regexp.QuoteMeta(nodeName))
+   re := regexp.MustCompile(pattern)
+   
+   match := re.FindStringSubmatch(dtsContent)
+   if len(match) < 2 {
+      return "", errors.New("node block not found")
+   }
+   return match[1], nil
+}
+
+func GetPartitionSizes(dtsContent string) (uint32, uint32, error) {
+   // 1. Verify boot_partition exists and has the correct label
+   bootBlock, err := extractNodeBlock(dtsContent, "boot_partition")
+   if err != nil {
+      return 0, 0, errors.New("boot_partition not found in DTS")
+   }
+
+   labelRegex := regexp.MustCompile(`label\s*=\s*"([^"]+)"`)
+   labelMatch := labelRegex.FindStringSubmatch(bootBlock)
+   if len(labelMatch) < 2 || labelMatch[1] != "mcuboot" {
+      return 0, 0, errors.New("boot_partition does not have the required 'mcuboot' label")
+   }
+
+   // 2. Extract and parse slot0_partition
+   slot0Block, err := extractNodeBlock(dtsContent, "slot0_partition")
+   if err != nil {
+      return 0, 0, errors.New("slot0_partition not found in DTS")
+   }
+   
+   slot0Size, err := parseRegSize(slot0Block)
+   if err != nil {
+      return 0, 0, fmt.Errorf("failed to parse size for slot0_partition: %v", err)
+   }
+
+   // 3. Extract and parse slot1_partition (Notice you mentioned slot2_partition in the prompt text, assuming slot1 based on function requirement)
+   slot1Block, err := extractNodeBlock(dtsContent, "slot1_partition")
+   if err != nil {
+      return 0, 0, errors.New("slot1_partition not found in DTS")
+   }
+   
+   slot1Size, err := parseRegSize(slot1Block)
+   if err != nil {
+      return 0, 0, fmt.Errorf("failed to parse size for slot1_partition: %v", err)
+   }
+
+   return slot0Size, slot1Size, nil
+}
+
+
+// parseRegSize extracts the size value from a Zephyr DTS 'reg' property.
+// It assumes the standard format: reg = <offset size>;
+func parseRegSize(block string) (uint32, error) {
+   // Match pattern: reg = < offset size > capturing both hex (0x...) or decimal
+   re := regexp.MustCompile(`reg\s*=\s*<\s*(0x[0-9a-fA-F]+|\d+)\s+(0x[0-9a-fA-F]+|\d+)\s*>`)
+   match := re.FindStringSubmatch(block)
+   
+   if len(match) < 3 {
+      return 0, errors.New("reg property missing or invalid format")
+   }
+   
+   sizeStr := match[2]
+   
+   // ParseUint with base 0 automatically handles both '0x' prefixed hex and standard decimal
+	rvUint64, err := strconv.ParseUint(sizeStr, 0, 32)
+
+	return uint32(rvUint64), err
+}
 // ConfigPathFromBin replaces the file extension of the given path with ".config"
 func ConfigPathFromBin(binPath string) string {
 	// filepath.Ext gets the current extension (e.g., ".bin")
 	// strings.TrimSuffix removes it, and we append the new one
 	return strings.TrimSuffix(binPath, filepath.Ext(binPath)) + ".config"
+}
+
+func DtsPathFromBin(binPath string) string {
+	return strings.TrimSuffix(binPath, filepath.Ext(binPath)) + ".dts"
+}
+
+func OutPathFromBin(binPath string) string {
+	return strings.TrimSuffix(binPath, filepath.Ext(binPath)) + ".signed.bin"
 }
 
 /* 
@@ -155,7 +235,9 @@ func main() {
 	var pem_file = flag.String("pem_file", "", "Path to the PEM file containg keys");
 	var erase_flash_dim = flag.Uint("erase_flash_dim", 0, "Minimum erasing flash sector dimension in bytes");
 
-	var config_file string = "undefined"; 
+	var config_file string = "undefined";
+	var dts_file string = "undefined";
+	var output_file string = "undefined";
 
 	flag.Parse();
 
@@ -173,52 +255,89 @@ func main() {
 	 * ---------------------------*/
 	
 	if *loader_bin_file != "" {
-		fmt.Println("loader bin file defined");
+		fmt.Println("+++ Loader file (%s) found!", *loader_bin_file);
 	   loader_bin, err = os.ReadFile(*loader_bin_file);
 		if err != nil {
 			log.Fatalf("Error reading loader binary file: %v", err)
 		}
 
 		/* 
-		 * Gathering config filename from bin one
-	    * -------------------------------------- */
+		 * Gathering config and dts filename from bin one
+	    * ----------------------------------------------- */
 		config_file = ConfigPathFromBin(*loader_bin_file);
+		dts_file = DtsPathFromBin(*loader_bin_file);
+		output_file = OutPathFromBin(*loader_bin_file);
 	} else {
-		fmt.Println("loader bin file UNDEFINED");
+		log.Fatalf("ERROR: loader bin file UNDEFINED");
 	}
 
 	/*
 	 * CALCULATING LOADER SIZE
 	 * ---------------------------*/
 	loader_len := uint32(len(loader_bin));
-	fmt.Printf(">>> Loader size %d (0x%08X)\n",loader_len, loader_len);
+	fmt.Printf("   >>> Loader size %d (0x%08X)\n",loader_len, loader_len);
 
-
-	if config_file == "undefined" {
-		log.Fatalf("Error: unable to find config file");
-	}
-
-	/* 
-	 * VERIFYING (from configuration) if PADDING was added
-	 * --------------------------------------------------- */
-	erase_padding_is_present, err := HasConfig(config_file,ConfigPaddingEraseDim)
-	if err != nil {
-		log.Fatalf("Error: problem during config file parsing")
-	}
-	_ = erase_padding_is_present;
-
+	var custom_padding_is_present bool = false;
 	var custom_padding_dim string = "1024";
 
-	custom_padding_is_present, err := HasConfig(config_file,ConfigPaddingEraseDim)
-	if err != nil {
-		log.Fatalf("Error: problem during config file parsing")
-	}
-	
-	if custom_padding_is_present {
-		custom_padding_dim, err = GetConfigValue(config_file,ConfigPaddingEraseDim)
+	if config_file != "undefined" {
+		fmt.Println("--- Parsing configuration file");
+		
+		 /*
+        * By default the erase padding is added
+        */
+
+		/*
+		erase_padding_is_present, err := HasConfig(config_file,ConfigPaddingEraseDim)
 		if err != nil {
 			log.Fatalf("Error: problem during config file parsing")
 		}
+		_ = erase_padding_is_present;
+		*/
+      
+		/* 
+		 * VERIFYING (from configuration) if PADDING was added
+		 * --------------------------------------------------- */
+
+		custom_padding_is_present, err = HasConfig(config_file,ConfigPaddingEraseDim)
+		if err != nil {
+			log.Fatalf("WARNING: problem during config file parsing")
+		}
+		
+		if custom_padding_is_present {
+			custom_padding_dim, err = GetConfigValue(config_file,ConfigPaddingEraseDim)
+			if err != nil {
+				log.Fatalf("WARNING: problem during config file parsing")
+			}
+		}
+	} else {
+		fmt.Println("Error: unable to find config file");
+	}
+
+	_ = custom_padding_dim;
+	
+	var slot0_dim uint32 = 0;
+	var slot1_dim uint32 = 0;
+
+	if dts_file != "undefined" {
+		fmt.Println("--- Parsing dts file");
+
+		dtsBytes, err := os.ReadFile(dts_file)
+		if err != nil {
+			fmt.Println("WARNING: Unable to read dts file")
+		}
+		
+		slot0_dim, slot1_dim, err = GetPartitionSizes(string(dtsBytes))
+		if err != nil {
+				fmt.Printf("Validation Error: %v\n", err)
+		} else {
+			fmt.Printf("   >>> Slot 0 size: %d bytes (0x%X)\n", slot0_dim, slot0_dim)
+			fmt.Printf("   >>> Slot 1 size: %d bytes (0x%X)\n", slot1_dim, slot1_dim)
+		}
+	}
+
+	if slot0_dim != slot1_dim {
+		fmt.Println("WARNING: slot1 and slot2 have different sizes");
 	}
 
 	/* 
@@ -226,7 +345,7 @@ func main() {
 	 * ---------------------------*/
 	var sketch_len uint32 = 0;
 	if *sketch_bin_file != "" {
-		fmt.Println("sketch bin file defined");
+		fmt.Println("+++ Sketch file (bin) %s found!", *sketch_bin_file);
 	   sketch_bin, err = os.ReadFile(*sketch_bin_file);
 		if err != nil {
 			log.Fatalf("Error reading sketch binary file: %v", err)
@@ -234,10 +353,10 @@ func main() {
 			sketch_len = uint32(len(sketch_bin));
 		}
 	} else {
-		fmt.Println("sketch bin file UNDEFINED");
+		fmt.Println("WARNING: sketch bin file not defined");
 	}
 
-	fmt.Printf(">>> sketch len = %d (0x%08X)\n", sketch_len, sketch_len);
+	fmt.Printf("   >>> sketch len = %d (0x%08X)\n", sketch_len, sketch_len);
 
 	/* 
     * CALCULATING PADDING
@@ -245,22 +364,24 @@ func main() {
 	
 	/* if no padding is configured OR erase padding is present, in any case
     * we pad with erase_flash_dim alignment (default) */
-	var padding_alignement uint32 = uint32(*erase_flash_dim);
+	//var padding_alignement uint32 = uint32(*erase_flash_dim);
 
 	/* Verify padding algorithm */
-	if custom_padding_is_present {
-		padInt, err := strconv.Atoi(custom_padding_dim);
-		padding_alignement = uint32(padInt);
-		if err != nil {
-			log.Fatalf("Error converting to integer:", err)
-		}
-	}
+	//if custom_padding_is_present {
+		//padInt, err := strconv.Atoi(custom_padding_dim);
+		//padding_alignement = uint32(padInt);
+		//if err != nil {
+			//fmt.Println("WARNING: problem while converting to integer:", err)
+		//}
+	//}
 	
 	var padding_len uint32 = 0;
 
-	padding_len = padding_alignement - (loader_len % padding_alignement);
+	//padding_len = padding_alignement - (loader_len % padding_alignement);
 
-	fmt.Printf(">>> padding len = %d (0x%08X)\n", padding_len, padding_len);
+	fmt.Println("--- SUMMARY:");
+
+	fmt.Printf("   >>> padding len = %d (0x%08X)\n", padding_len, padding_len);
 
 	align_padding := make([]byte,padding_len);
 
@@ -269,13 +390,20 @@ func main() {
 	 * -------------------------*/
 
 	sketch_offset := uint32(padding_len + loader_len);
-	fmt.Printf(">>> sketch offset = %d (0x%x)\n", sketch_offset, sketch_offset)
+	fmt.Printf("   >>> sketch offset = %d (0x%x)\n", sketch_offset, sketch_offset)
 
-	/* check dimensions (?) */
+	
+	/* 
+	 * Getting total size available
+	 * ---------------------------- */
 
 	total_size := loader_len + padding_len + sketch_len;
 
-	fmt.Printf(">>> total size = %d (0x%08X)\n", total_size, total_size);
+	fmt.Printf("   >>> total size = %d (0x%08X)\n", total_size, total_size);
+
+	if(total_size > slot0_dim) {
+		log.Fatalf("ERROR: Image size greater than slot dimension");
+	}
 
 	/* 
 	 * MAKE NEW IMAGE
@@ -380,12 +508,13 @@ func main() {
 		log.Fatalf("Error: Final image size (%d) exceeds the defined slot size (%d)!", totalImageSize, SlotSize)
 	}
 
-	err = os.WriteFile("zephyr.signed.bin", finalImg.Bytes(), 0644)
+	err = os.WriteFile(output_file, finalImg.Bytes(), 0644)
 	if err != nil {
-		log.Fatalf("Failed to write output: %v", err)
+		log.Fatalf("Failed to write output file(%s), error %v",output_file, err)
 	}
 	
-	fmt.Println("Image successfully signed and matched to MCUboot specs!")
+	fmt.Println("   === IMAGE built and signed successfully")
+	fmt.Println("   === Output file: %s", output_file)
 }
 
 // appendTLVs handles the exact struct packing required by MCUboot
